@@ -2,10 +2,12 @@ package comm
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strings"
 
 	"github.com/GMWalletApp/epusdt/middleware"
+	"github.com/GMWalletApp/epusdt/model/data"
 	"github.com/GMWalletApp/epusdt/model/mdb"
 	"github.com/GMWalletApp/epusdt/model/request"
 	"github.com/GMWalletApp/epusdt/model/service"
@@ -147,8 +149,19 @@ func (c *BaseCommController) CreateTransactionAndRedirect(ctx echo.Context) (err
 		log.Sugar.Errorf("validate request error: %v", err)
 		return c.FailJson(ctx, err)
 	}
-	resp, err := service.CreateTransaction(req, apiKeyFromContext(ctx))
+	apiKey := apiKeyFromContext(ctx)
+	resp, err := service.CreateTransaction(req, apiKey)
 	if err != nil {
+		if errors.Is(err, constant.OrderAlreadyExists) {
+			existingOrder, findErr := data.GetOrderInfoByOrderId(req.OrderId)
+			if findErr != nil {
+				log.Sugar.Errorf("get existing epay order error: %v", findErr)
+				return c.FailJson(ctx, findErr)
+			}
+			if existingOrder.ID > 0 && apiKey != nil && existingOrder.ApiKeyID == apiKey.ID && strings.EqualFold(existingOrder.PaymentType, mdb.PaymentTypeEpay) {
+				return ctx.Redirect(http.StatusFound, "/pay/checkout-counter/"+existingOrder.TradeId)
+			}
+		}
 		log.Sugar.Errorf("create transaction error: %v", err)
 		return c.FailJson(ctx, err)
 	}

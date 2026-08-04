@@ -213,6 +213,10 @@ func doPost(e *echo.Echo, path string, body map[string]interface{}) *httptest.Re
 }
 
 func signEpayValues(values url.Values) url.Values {
+	return signEpayValuesWithSecret(values, testAPIToken)
+}
+
+func signEpayValuesWithSecret(values url.Values, secret string) url.Values {
 	signParams := make(map[string]interface{})
 	for key, items := range values {
 		if key == "sign" || key == "sign_type" || len(items) == 0 {
@@ -220,7 +224,7 @@ func signEpayValues(values url.Values) url.Values {
 		}
 		signParams[key] = items[0]
 	}
-	sig, _ := sign.Get(signParams, testAPIToken)
+	sig, _ := sign.Get(signParams, secret)
 	values.Set("sign", sig)
 	values.Set("sign_type", "MD5")
 	return values
@@ -1728,6 +1732,120 @@ func TestEpaySubmitPhpPostFormCompatible(t *testing.T) {
 	}
 	if !strings.HasPrefix(rec.Header().Get("Location"), "/pay/checkout-counter/") {
 		t.Fatalf("expected checkout redirect, got %q", rec.Header().Get("Location"))
+	}
+}
+
+func TestEpaySubmitPhpPostFormRepeatRedirectsToOriginalCheckout(t *testing.T) {
+	e := setupTestEnv(t)
+
+	values := signEpayValues(url.Values{
+		"pid":          {"1"},
+		"name":         {"epay-post-repeat-001"},
+		"type":         {"alipay"},
+		"money":        {"1.00"},
+		"out_trade_no": {"epay-post-repeat-001"},
+		"notify_url":   {"https://93.184.216.34/notify"},
+		"return_url":   {"http://localhost/return"},
+	})
+
+	firstRec := doFormPost(e, "/payments/epay/v1/order/create-transaction/submit.php", values)
+	if firstRec.Code != http.StatusFound {
+		t.Fatalf("first request expected 302, got %d body=%s", firstRec.Code, firstRec.Body.String())
+	}
+	firstLocation := firstRec.Header().Get("Location")
+	if !strings.HasPrefix(firstLocation, "/pay/checkout-counter/") {
+		t.Fatalf("first request expected checkout redirect, got %q", firstLocation)
+	}
+
+	secondRec := doFormPost(e, "/payments/epay/v1/order/create-transaction/submit.php", values)
+	if secondRec.Code != http.StatusFound {
+		t.Fatalf("repeat request expected 302, got %d body=%s", secondRec.Code, secondRec.Body.String())
+	}
+	if secondLocation := secondRec.Header().Get("Location"); secondLocation != firstLocation {
+		t.Fatalf("repeat request redirect = %q, want original %q", secondLocation, firstLocation)
+	}
+}
+
+func TestEpaySubmitPhpRepeatDoesNotRedirectCrossKeyOrder(t *testing.T) {
+	e := setupTestEnv(t)
+
+	const otherPID = "2"
+	const otherSecret = "other-epay-secret"
+	if err := dao.Mdb.Create(&mdb.ApiKey{
+		Name:      "test-epay-pid-2",
+		Pid:       otherPID,
+		SecretKey: otherSecret,
+		Status:    mdb.ApiKeyStatusEnable,
+	}).Error; err != nil {
+		t.Fatalf("seed second epay api key: %v", err)
+	}
+
+	orderID := "epay-cross-key-collision-001"
+	firstValues := signEpayValues(url.Values{
+		"pid":          {"1"},
+		"name":         {orderID},
+		"type":         {"alipay"},
+		"money":        {"1.00"},
+		"out_trade_no": {orderID},
+		"notify_url":   {"https://93.184.216.34/notify"},
+		"return_url":   {"http://localhost/return"},
+	})
+	firstRec := doFormPost(e, "/payments/epay/v1/order/create-transaction/submit.php", firstValues)
+	if firstRec.Code != http.StatusFound {
+		t.Fatalf("first request expected 302, got %d body=%s", firstRec.Code, firstRec.Body.String())
+	}
+
+	secondValues := signEpayValuesWithSecret(url.Values{
+		"pid":          {otherPID},
+		"name":         {orderID},
+		"type":         {"alipay"},
+		"money":        {"1.00"},
+		"out_trade_no": {orderID},
+		"notify_url":   {"https://93.184.216.34/notify"},
+		"return_url":   {"http://localhost/return"},
+	}, otherSecret)
+	secondRec := doFormPost(e, "/payments/epay/v1/order/create-transaction/submit.php", secondValues)
+	if secondRec.Code != http.StatusBadRequest {
+		t.Fatalf("cross-key repeat expected 400, got %d body=%s", secondRec.Code, secondRec.Body.String())
+	}
+	if got := int(parseResp(t, secondRec)["status_code"].(float64)); got != 10002 {
+		t.Fatalf("cross-key repeat status_code = %d, want 10002", got)
+	}
+}
+
+func TestEpaySubmitPhpRepeatDoesNotRedirectNonEPayOrder(t *testing.T) {
+	e := setupTestEnv(t)
+
+	orderID := "epay-non-epay-collision-001"
+	createBody := signBody(map[string]interface{}{
+		"pid":        "1",
+		"order_id":   orderID,
+		"amount":     1.00,
+		"token":      "usdt",
+		"currency":   "cny",
+		"network":    "tron",
+		"notify_url": "https://93.184.216.34/notify",
+	})
+	createRec := doPost(e, "/payments/gmpay/v1/order/create-transaction", createBody)
+	if createRec.Code != http.StatusOK {
+		t.Fatalf("create GMPay order expected 200, got %d body=%s", createRec.Code, createRec.Body.String())
+	}
+
+	values := signEpayValues(url.Values{
+		"pid":          {"1"},
+		"name":         {orderID},
+		"type":         {"alipay"},
+		"money":        {"1.00"},
+		"out_trade_no": {orderID},
+		"notify_url":   {"https://93.184.216.34/notify"},
+		"return_url":   {"http://localhost/return"},
+	})
+	rec := doFormPost(e, "/payments/epay/v1/order/create-transaction/submit.php", values)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("non-EPay collision expected 400, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	if got := int(parseResp(t, rec)["status_code"].(float64)); got != 10002 {
+		t.Fatalf("non-EPay collision status_code = %d, want 10002", got)
 	}
 }
 
