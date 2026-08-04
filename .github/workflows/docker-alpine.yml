@@ -1,6 +1,7 @@
 name: docker-alpine-epusdt
 
 on:
+  workflow_dispatch:
   push:
     tags:
       - "v*"
